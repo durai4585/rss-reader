@@ -17,19 +17,25 @@ package rss.reader;
 
 import com.datastax.driver.core.BoundStatement;
 import com.datastax.driver.core.PreparedStatement;
+import com.datastax.driver.core.Row;
 import io.vertx.cassandra.CassandraClient;
 import io.vertx.cassandra.CassandraClientOptions;
 import io.vertx.cassandra.ResultSet;
 import io.vertx.core.AbstractVerticle;
+import io.vertx.core.CompositeFuture;
 import io.vertx.core.Future;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpServer;
+import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.handler.StaticHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.util.List;
+import java.util.stream.Collectors;
 
 public class AppVerticle extends AbstractVerticle {
 
@@ -41,6 +47,8 @@ public class AppVerticle extends AbstractVerticle {
 
     private CassandraClient client;
 
+    private PreparedStatement selectChannelInfo;
+    private PreparedStatement selectRssLinksByLogin;
     private PreparedStatement insertNewLinkForUser;
 
     @Override
@@ -76,13 +84,29 @@ public class AppVerticle extends AbstractVerticle {
     }
 
     private Future<Void> prepareNecessaryQueries() {
+        Future<PreparedStatement> selectChannelInfoPrepFuture = Future.future();
+        client.prepare("SELECT description, title, site_link, rss_link FROM channel_info_by_rss_link WHERE rss_link = ? ;", selectChannelInfoPrepFuture);
+
+        Future<PreparedStatement> selectRssLinkByLoginPrepFuture = Future.future();
+        client.prepare("SELECT rss_link FROM rss_by_user WHERE login = ? ;", selectRssLinkByLoginPrepFuture);
+
         Future<PreparedStatement> insertNewLinkForUserPrepFuture = Future.future();
         client.prepare("INSERT INTO rss_by_user (login , rss_link ) VALUES ( ?, ?);", insertNewLinkForUserPrepFuture);
 
-        return insertNewLinkForUserPrepFuture.compose(preparedStatement -> {
-            insertNewLinkForUser = preparedStatement;
-            return Future.succeededFuture();
-        });
+        return CompositeFuture.all(
+                selectChannelInfoPrepFuture.compose(preparedStatement -> {
+                    selectChannelInfo = preparedStatement;
+                    return Future.succeededFuture();
+                }),
+                selectRssLinkByLoginPrepFuture.compose(preparedStatement -> {
+                    selectRssLinksByLogin = preparedStatement;
+                    return Future.succeededFuture();
+                }),
+                insertNewLinkForUserPrepFuture.compose(preparedStatement -> {
+                    insertNewLinkForUser = preparedStatement;
+                    return Future.succeededFuture();
+                })
+        ).mapEmpty();
     }
 
     @SuppressWarnings("UnusedReturnValue")
@@ -110,7 +134,50 @@ public class AppVerticle extends AbstractVerticle {
     }
 
     private void getRssChannels(RoutingContext ctx) {
-        // TODO STEP 2
+        String userId = ctx.request().getParam("user_id");
+        if (userId == null) {
+            responseWithInvalidRequest(ctx);
+        } else {
+            Future<List<Row>> future = Future.future();
+            client.executeWithFullFetch(selectRssLinksByLogin.bind(userId), future);
+            future.compose(rows -> {
+                List<String> links = rows.stream()
+                        .map(row -> row.getString(0))
+                        .collect(Collectors.toList());
+
+                return CompositeFuture.all(
+                        links.stream().map(selectChannelInfo::bind).map(statement -> {
+                            Future<List<Row>> channelInfoRow = Future.future();
+                            client.executeWithFullFetch(statement, channelInfoRow);
+                            return channelInfoRow;
+                        }).collect(Collectors.toList())
+                );
+            }).setHandler(h -> {
+                if (h.succeeded()) {
+                    CompositeFuture result = h.result();
+                    List<List<Row>> results = result.list();
+                    List<Row> list = results.stream()
+                            .flatMap(List::stream)
+                            .collect(Collectors.toList());
+                    JsonObject responseJson = new JsonObject();
+                    JsonArray channels = new JsonArray();
+
+                    list.forEach(eachRow -> channels.add(
+                            new JsonObject()
+                                    .put("description", eachRow.getString(0))
+                                    .put("title", eachRow.getString(1))
+                                    .put("link", eachRow.getString(2))
+                                    .put("rss_link", eachRow.getString(3))
+                    ));
+
+                    responseJson.put("channels", channels);
+                    ctx.response().end(responseJson.toString());
+                } else {
+                    log.error("failed to get rss channels", h.cause());
+                    ctx.response().setStatusCode(500).end("Unable to retrieve the info from C*");
+                }
+            });
+        }
     }
 
     private void postRssLink(RoutingContext ctx) {
